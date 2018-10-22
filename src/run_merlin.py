@@ -45,6 +45,7 @@ import math
 
 import subprocess
 import socket # only for socket.getfqdn()
+import multiprocessing
 
 #  numpy & theano imports need to be done in this order (only for some numpy installations, not sure why)
 import numpy
@@ -74,6 +75,7 @@ from models.deep_rnn import DeepRecurrentNetwork
 
 from utils.compute_distortion import DistortionComputation, IndividualDistortionComp
 from utils.generate import generate_wav
+from utils.acous_feat_extraction import acous_feat_extraction
 from utils.learn_rates import ExpDecreaseLearningRate
 
 from io_funcs.binary_io import  BinaryIOCollection
@@ -281,7 +283,7 @@ def train_DNN(train_xy_file_list, valid_xy_file_list, \
                     sys.exit('old and new weight matrices have different shapes')
                 k = k + 1        
     train_fn, valid_fn = dnn_model.build_finetune_functions(
-                    (train_set_x, train_set_y), (valid_set_x, valid_set_y), use_lhuc)  #, batch_size=batch_size
+                    (train_set_x, train_set_y), (valid_set_x, valid_set_y), use_lhuc, layer_index=cfg.freeze_layers)  #, batch_size=batch_size
     logger.info('fine-tuning the %s model' %(model_type))
 
     start_time = time.time()
@@ -476,6 +478,43 @@ def dnn_hidden_generation(valid_file_list, nnets_file_name, n_ins, n_outs, out_f
         fid.close()
 
 
+def perform_acoustic_composition_on_split(args):
+    """ Performs acoustic composition on one chunk of data.
+        This is used as input for Pool.map to allow parallel acoustic composition.
+    """
+    (delta_win, acc_win, in_file_list_dict, nn_cmp_file_list, in_dimension_dict, out_dimension_dict) = args
+    acoustic_worker = AcousticComposition(delta_win = delta_win, acc_win = acc_win)
+    acoustic_worker.prepare_nn_data(in_file_list_dict, nn_cmp_file_list, in_dimension_dict, out_dimension_dict)
+
+
+def perform_acoustic_composition(delta_win, acc_win, in_file_list_dict, nn_cmp_file_list, cfg, parallel=True):
+    """ Runs acoustic composition from in_file_list_dict to nn_cmp_file_list.
+        If parallel is true, splits the data into multiple chunks and calls
+        perform_acoustic_composition_on_split for each chunk.
+    """
+    if parallel:
+        num_splits = multiprocessing.cpu_count()
+        pool = multiprocessing.Pool(num_splits)
+
+        # split data into a list of num_splits tuples with each tuple representing
+        # the parameters for perform_acoustic_compositon_on_split
+        splits_full = [
+             (delta_win,
+              acc_win,
+              {stream: in_file_list_dict[stream][i::num_splits] for stream in in_file_list_dict},
+              nn_cmp_file_list[i::num_splits],
+              cfg.in_dimension_dict,
+              cfg.out_dimension_dict
+             ) for i in range(num_splits) ]
+
+        pool.map(perform_acoustic_composition_on_split, splits_full)
+        pool.close()
+        pool.join()
+    else:
+        acoustic_worker = AcousticComposition(delta_win = delta_win, acc_win = acc_win)
+        acoustic_worker.prepare_nn_data(in_file_list_dict, nn_cmp_file_list, cfg.in_dimension_dict, cfg.out_dimension_dict)
+
+
 def main_function(cfg):
     file_paths = FilePaths(cfg)
 
@@ -508,6 +547,7 @@ def main_function(cfg):
 
     ###total file number including training, development, and testing
     total_file_number = len(file_id_list)
+
     assert cfg.train_file_number+cfg.valid_file_number+cfg.test_file_number == total_file_number, 'check train, valid, test file number'
 
     data_dir = cfg.data_dir
@@ -565,6 +605,16 @@ def main_function(cfg):
     label_norm_file = file_paths.label_norm_file
 
     test_id_list = file_paths.test_id_list
+
+    # Debug:----------------------------------
+    if cfg.ACFTEXTR:
+        logger.info('acoustic feature extraction')
+        acous_feat_extraction(cfg.nat_wav_dir, file_id_list, cfg)
+        #generate_wav(gen_dir, file_id_list, cfg)     # generated speech
+
+
+
+    #-----------------------------------------
 
     if cfg.NORMLAB:
         # simple HTS labels
@@ -632,14 +682,14 @@ def main_function(cfg):
                 in_file_list_dict[feature_name] = prepare_file_path_list(test_id_list, cfg.in_dir_dict[feature_name], cfg.file_extension_dict[feature_name], False)
             nn_cmp_file_list      = prepare_file_path_list(test_id_list, nn_cmp_dir, cfg.cmp_ext)
             nn_cmp_norm_file_list = prepare_file_path_list(test_id_list, nn_cmp_norm_dir, cfg.cmp_ext)
-        
-        acoustic_worker = AcousticComposition(delta_win = delta_win, acc_win = acc_win)
 
         if 'dur' in list(cfg.in_dir_dict.keys()) and cfg.AcousticModel:
             lf0_file_list = file_paths.get_lf0_file_list()
+            acoustic_worker = AcousticComposition(delta_win = delta_win, acc_win = acc_win)
             acoustic_worker.make_equal_frames(dur_file_list, lf0_file_list, cfg.in_dimension_dict)
-
-        acoustic_worker.prepare_nn_data(in_file_list_dict, nn_cmp_file_list, cfg.in_dimension_dict, cfg.out_dimension_dict)
+            acoustic_worker.prepare_nn_data(in_file_list_dict, nn_cmp_file_list, cfg.in_dimension_dict, cfg.out_dimension_dict)
+        else:
+            perform_acoustic_composition(delta_win, acc_win, in_file_list_dict, nn_cmp_file_list, cfg, parallel=True)
 
         if cfg.remove_silence_using_binary_labels:
             ## do this to get lab_dim:
